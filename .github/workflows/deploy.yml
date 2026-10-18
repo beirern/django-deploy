@@ -1,0 +1,330 @@
+name: Release and deploy to Lightsail
+
+on:
+  workflow_call:
+    inputs:
+      deploy-directory:
+        description: Absolute application directory on the server, without spaces
+        required: true
+        type: string
+      compose-files:
+        description: Newline-separated Compose paths, in merge order
+        type: string
+        default: docker-compose.yml
+      deployment-files:
+        description: Newline-separated files or directories to copy from the application
+        type: string
+        default: docker-compose.yml
+      build-args:
+        description: Newline-separated Docker build arguments; never put secrets here
+        type: string
+        default: ''
+      environment:
+        description: GitHub environment in the calling application repository
+        type: string
+        default: production
+      ssh-port:
+        type: number
+        default: 22
+      wait-timeout:
+        description: Maximum seconds to wait for Compose readiness
+        type: number
+        default: 180
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AWS_REGION:
+        required: true
+      ECR_REGISTRY:
+        required: true
+      ECR_REPOSITORY:
+        required: true
+      SERVER_HOST:
+        required: true
+      SERVER_USER:
+        required: true
+      SERVER_SSH_KEY:
+        required: true
+      SERVER_KNOWN_HOSTS:
+        required: true
+      APP_ENV:
+        required: true
+    outputs:
+      version:
+        description: New semantic version; empty when no release was published
+        value: ${{ jobs.release.outputs.version }}
+      published:
+        description: Whether Semantic Release published a new release
+        value: ${{ jobs.release.outputs.published }}
+
+permissions:
+  contents: read
+
+# Lock the entire pipeline, including release creation. Never cancel a deployment
+# in progress. GitHub may replace an older pending run with a newer pending run.
+concurrency:
+  group: django-deploy-${{ github.repository }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      version: ${{ steps.semantic.outputs.new_release_version }}
+      published: ${{ steps.semantic.outputs.new_release_published }}
+      commit: ${{ steps.semantic.outputs.new_release_git_head }}
+    steps:
+      - name: Check out application history
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Require application release configuration
+        shell: bash
+        run: test -f .releaserc.json
+
+      - name: Publish semantic release
+        id: semantic
+        uses: cycjimmy/semantic-release-action@b12c8f6015dc215fe37bc154d4ad456dd3833c90 # v6
+        with:
+          semantic_version: 25.0.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-and-push:
+    needs: release
+    if: needs.release.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the released application commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.release.outputs.commit }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Log in to ECR
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build and push version and commit tags
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          push: true
+          build-args: ${{ inputs.build-args }}
+          tags: |
+            ${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_REPOSITORY }}:${{ needs.release.outputs.version }}
+            ${{ secrets.ECR_REGISTRY }}/${{ secrets.ECR_REPOSITORY }}:sha-${{ needs.release.outputs.commit }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: [release, build-and-push]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Check out the released application commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.release.outputs.commit }}
+
+      - name: Configure AWS credentials for the temporary registry login
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Prepare SSH credentials
+        shell: bash
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          SERVER_KNOWN_HOSTS: ${{ secrets.SERVER_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$SERVER_SSH_KEY"
+          test -n "$SERVER_KNOWN_HOSTS"
+          mkdir -p "$RUNNER_TEMP/django-deploy"
+          printf '%s\n' "$SERVER_SSH_KEY" > "$RUNNER_TEMP/django-deploy/key"
+          printf '%s\n' "$SERVER_KNOWN_HOSTS" > "$RUNNER_TEMP/django-deploy/known_hosts"
+          ssh-keygen -y -f "$RUNNER_TEMP/django-deploy/key" > /dev/null
+
+      # This inline script makes the reusable workflow self-contained: no second
+      # checkout of a potentially different django-deploy ref is required.
+      - name: Prepare deployment bundle
+        shell: bash
+        env:
+          DEPLOY_DIRECTORY: ${{ inputs.deploy-directory }}
+          COMPOSE_FILES: ${{ inputs.compose-files }}
+          DEPLOYMENT_FILES: ${{ inputs.deployment-files }}
+          WAIT_TIMEOUT: ${{ inputs.wait-timeout }}
+          APP_ENV: ${{ secrets.APP_ENV }}
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 - <<'PY'
+          import os
+          from pathlib import Path, PurePosixPath
+          import re
+          import shlex
+          import shutil
+          import tarfile
+
+          root = Path.cwd().resolve()
+          bundle = Path(os.environ['RUNNER_TEMP']) / 'django-deploy' / 'bundle'
+          bundle.mkdir(parents=True)
+          files = bundle / 'files'
+          files.mkdir()
+          target = os.environ['DEPLOY_DIRECTORY']
+          if not re.fullmatch(r'/[A-Za-z0-9_./-]+', target) or '..' in target.split('/'):
+              raise SystemExit('deploy-directory must be an absolute path without spaces or ..')
+          if target.rstrip('/') in ('', '/home', '/root', '/tmp', '/var', '/usr', '/etc'):
+              raise SystemExit('Use a dedicated application directory')
+          timeout = int(os.environ['WAIT_TIMEOUT'])
+          if not 1 <= timeout <= 600:
+              raise SystemExit('wait-timeout must be between 1 and 600 seconds')
+
+          def paths(value):
+              result = []
+              for item in value.splitlines():
+                  item = item.strip()
+                  if not item:
+                      continue
+                  path = PurePosixPath(item)
+                  if (path.is_absolute() or '..' in path.parts or not path.parts
+                          or any(part.startswith('.') for part in path.parts)):
+                      raise SystemExit('Deployment paths must be relative, without hidden components or ..')
+                  if not re.fullmatch(r'[A-Za-z0-9_./-]+', item):
+                      raise SystemExit('Deployment paths must not contain spaces or shell syntax')
+                  result.append(path)
+              if not result:
+                  raise SystemExit('At least one deployment/Compose path is required')
+              return result
+
+          compose = paths(os.environ['COMPOSE_FILES'])
+          sources = paths(os.environ['DEPLOYMENT_FILES'])
+          for source in sources:
+              full = root / source
+              if full.is_symlink() or not full.exists():
+                  raise SystemExit('Deployment source is missing or is a symbolic link')
+              entries = [full, *full.rglob('*')] if full.is_dir() else [full]
+              for entry in entries:
+                  if entry.is_symlink() or not entry.resolve().is_relative_to(root):
+                      raise SystemExit('Symbolic links are not supported in deployment files')
+                  if any(part.startswith('.') for part in entry.relative_to(root).parts):
+                      raise SystemExit('Hidden files must not be included in deployment directories')
+              dest = files / source
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              if full.is_dir():
+                  shutil.copytree(full, dest, dirs_exist_ok=True)
+              else:
+                  shutil.copy2(full, dest)
+          if any(not (files / path).is_file() for path in compose):
+              raise SystemExit('Every compose-file must be included in deployment-files')
+          app_env = os.environ['APP_ENV']
+          if not app_env.strip():
+              raise SystemExit('APP_ENV is empty; pass the application environment secret')
+          (bundle / 'app.env').write_text(app_env.rstrip('\n') + '\n')
+          (bundle / 'app.env').chmod(0o600)
+          image = '/'.join([os.environ['ECR_REGISTRY'], os.environ['ECR_REPOSITORY']])
+          image += ':' + os.environ['VERSION']
+          config = {
+              'DEPLOY_DIRECTORY': target,
+              'IMAGE': image,
+              'ECR_REGISTRY': os.environ['ECR_REGISTRY'],
+              'WAIT_TIMEOUT': str(timeout),
+          }
+          text = ''.join(f'{key}={shlex.quote(value)}\n' for key, value in config.items())
+          text += 'COMPOSE_FILES=(' + ' '.join(shlex.quote(str(p)) for p in compose) + ')\n'
+          (bundle / 'config.sh').write_text(text)
+          PY
+          aws ecr get-login-password > "$RUNNER_TEMP/django-deploy/bundle/ecr-password"
+          cat > "$RUNNER_TEMP/django-deploy/bundle/deploy.sh" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          umask 077
+          stage=$1
+          # Generated on the runner using shell quoting, never from APP_ENV.
+          source "$stage/config.sh"
+          export IMAGE
+          export DOCKER_CONFIG="$stage/docker-config"
+          docker compose version > /dev/null
+          docker login --username AWS --password-stdin "$ECR_REGISTRY" < "$stage/ecr-password"
+          rm -f "$stage/ecr-password"
+          mkdir -p "$DEPLOY_DIRECTORY"
+          cp -a "$stage/files/." "$DEPLOY_DIRECTORY/"
+          install -m 600 "$stage/app.env" "$DEPLOY_DIRECTORY/.env.next"
+          mv -f "$DEPLOY_DIRECTORY/.env.next" "$DEPLOY_DIRECTORY/.env"
+          cd "$DEPLOY_DIRECTORY"
+          compose=(docker compose)
+          for file in "${COMPOSE_FILES[@]}"; do
+            compose+=(-f "$file")
+          done
+          # Quiet validation prevents resolved application secrets entering logs.
+          "${compose[@]}" config --quiet
+          "${compose[@]}" pull
+          # --no-build prevents a fallback build on the server. Healthchecked
+          # services must be healthy; services without checks must be running.
+          "${compose[@]}" up --detach --no-build --wait --wait-timeout "$WAIT_TIMEOUT"
+          printf 'Deployment is ready.\n'
+          SH
+          tar -czf "$RUNNER_TEMP/django-deploy/bundle.tar.gz" -C "$RUNNER_TEMP/django-deploy/bundle" .
+
+      - name: Deploy and wait for readiness
+        shell: bash
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SSH_PORT: ${{ inputs.ssh-port }}
+        run: |
+          set -euo pipefail
+          [[ "$SERVER_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]]
+          [[ "$SERVER_USER" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ ]]
+          [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && (( SSH_PORT >= 1 && SSH_PORT <= 65535 ))
+          remote_script=$(cat <<'SH'
+          set -eu
+          umask 077
+          stage=$(mktemp -d)
+          trap 'rm -rf -- "$stage"' EXIT
+          tar -xzf - -C "$stage"
+          bash "$stage/deploy.sh" "$stage"
+          SH
+          )
+          ssh -F /dev/null -p "$SSH_PORT" \
+            -i "$RUNNER_TEMP/django-deploy/key" \
+            -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
+            -o "UserKnownHostsFile=$RUNNER_TEMP/django-deploy/known_hosts" \
+            "$SERVER_USER@$SERVER_HOST" \
+            "$remote_script" \
+            < "$RUNNER_TEMP/django-deploy/bundle.tar.gz"
+
+      - name: Remove temporary credentials and deployment bundle
+        if: always()
+        shell: bash
+        run: rm -rf -- "$RUNNER_TEMP/django-deploy"
