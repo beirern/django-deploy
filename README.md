@@ -157,9 +157,17 @@ separate checkout of this repository or runtime script download is needed.
 Local checks:
 
 ```sh
-uv run --with-requirements requirements-dev.txt python -m unittest discover -s tests -v
+uv sync --locked
+uv run --locked python -m unittest discover -s tests -v
 actionlint .github/workflows/*.yml
 ```
+
+This repository uses uv, `pyproject.toml`, and a committed `uv.lock` for Python
+dependencies, with Python selected by `.python-version`. CI installs the same
+locked development dependencies. Use `uv add --dev` to add tooling and commit
+both manifest and lockfile. Semantic Release itself is a Node-based GitHub
+Action; application images continue to use their own Dockerfiles and dependency
+managers until those applications are onboarded.
 
 CI runs workflow linting and credential-free tests of bundle generation, secret
 handling, path validation, and the remote Compose invocation. Tests use temporary
